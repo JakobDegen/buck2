@@ -174,6 +174,9 @@ impl SetSketch {
     /// **Important:** This method relies on the locality-sensitive property of the sketch
     /// registers (i.e. that the register value for an element is independent of which set it
     /// belongs to). It must **not** be used with non-locality-sensitive weighting schemes.
+    ///
+    /// For sketches built with `sketch_weighted`, the proportions are proportions of weight
+    /// mass rather than of element count.
     pub fn approx_proportion_not_included(&self, other: &SetSketch) -> (f64, f64) {
         // Implementation notes:
         //
@@ -431,6 +434,9 @@ where
     ///
     /// Use of this function can be mixed with the unweighted `sketch`; `sketch` is just an alias
     /// for this with weight 1.
+    ///
+    /// For new sketch corpuses, prefer `sketch_weighted`, which is just as fast but keeps
+    /// locality sensitivity.
     pub fn sketch_weighted_locality_unstable(&mut self, to_sketch: &T, weight: u64) {
         if weight == 0 {
             return;
@@ -518,6 +524,18 @@ fn sample_min_exp_stable(rng: &mut Xoshiro256PlusPlus, n: u64) -> f64 {
     -(-min).ln_1p()
 }
 
+/// Derives the seed of the dart stream for a given (element hash, octave) pair.
+///
+/// SplitMix64-style finalizer. Together with the dart stream layout this defines the
+/// register values of every sketch produced by `sketch_weighted`; it must never change
+/// once such sketches are persisted.
+fn mix_octave_seed(hval: u64, octave: u32) -> u64 {
+    let mut z = hval ^ 0x9E3779B97F4A7C15u64.wrapping_mul(octave as u64 + 1);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 impl<T, H> SetSketcher<T, H>
 where
     T: Hash,
@@ -535,6 +553,9 @@ where
     ///     number of registers.
     ///
     /// This function also must not be mixed with unweighted sketches (for a given item anyway).
+    ///
+    /// For new sketch corpuses, prefer `sketch_weighted`, which offers the same guarantees in
+    /// amortized O(1).
     pub fn sketch_weighted_locality_stable(&mut self, to_sketch: &T, weight: u64) {
         if weight == 0 {
             return;
@@ -554,6 +575,175 @@ where
                 *r = k;
             }
         }
+    }
+}
+
+impl<T, H> SetSketcher<T, H>
+where
+    T: Hash,
+    H: Hasher + Default,
+{
+    /// Perform a weighted sketch of an item, with a slightly unusual API.
+    ///
+    /// The contract for the output is the strongest form of weighted sketching you could want:
+    /// Inserting a new item with weight W is indistinguishable from inserting W different items of
+    /// weight 1, both in terms of the distribution of a single sketch, and also jointly across
+    /// sketches. So concretely, two sketches in which the same item was sketched with weight W vs
+    /// W+1, the difference in the distribution of registers is as-if a single item of weight 1 had
+    /// been added.
+    ///
+    /// In exchange for that, the caller must strictly provide for two pre-conditions:
+    ///  1. `0 < weight <= max_weight`, unsurprisingly
+    ///  2.  A given item (identified by the seed) may only ever be used with a single `max_weight`
+    ///      parameter; if you mix `max_weight`s for a single item, all bets are off.
+    ///
+    /// Furthermore, the runtime of this function is `O(max_weight / (weight + cardinality))`, where
+    /// cardinality is the existing cardinality of the sketch. Since usually you don't control the
+    /// weight, that means you must generally ensure that the max_weight is not more than a constant
+    /// factor times the existing cardinality.
+    fn dart_sketch_weighted(&mut self, seed: u64, weight: f64, max_weight: f64) {
+        debug_assert!(weight > 0. && weight <= max_weight);
+        // We are going to start by ignoring the weight vs max_weight difference and pretending we
+        // are just inserting a W weighted item with weight `max_weight` (not `weight`!). Inserting
+        // an item into the sketch means sampling from an appropriate exponential distribution and
+        // computing the minimum across all samples, once for each register of the m registers. We
+        // do a similar optimization to the paper and flip things around a bit:
+        //  1. We instead sample `m * W` times from the exponential distribution and assign the
+        //     samples to registers uniformly at random. These are the "darts." Think of them as
+        //     being thrown against an m by W wall.
+        //  2. Instead of just sampling mW times, we sample directly from the distributions of "what
+        //     is the minimum of those mW samples likely to be," "what is the difference between the
+        //     minimum and second smallest likely to be," etc. and then reconstruct our sequence of
+        //     mW samples from that. Because we end up computing minimums of everything, we can
+        //     almost always stop early after m samples (and generally much sooner), giving us the
+        //     amortized constant time we need.
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        let scale = self.params.inva / (self.params.m as f64 * max_weight);
+        // Here is where we remember that the actual weight is not `max_weight` but rather `weight`:
+        // We deal with that by simply omitting each dart with appropriate probability. Note that
+        // it's important that we otherwise make exactly the same choices about where the darts
+        // land, regardless of which ones we do or don't include.
+        let keep_fraction = weight / max_weight;
+        let mut x: f64 = 0.;
+        let mut darts_since_refresh: usize = 0;
+        loop {
+            // It turns out all the distributions of smallest dart/difference between adjacent darts
+            // in sorted order are just this.
+            x += scale * rng.sample::<f64, Exp1>(Exp1);
+            let k = Self::exp_sample_into_register_value(x, self.params);
+            // Darts arrive in increasing x, so k is non-increasing along the stream: once
+            // one dart cannot beat the smallest register, no later dart can beat any
+            // register.
+            if k as f64 <= self.lower_k {
+                break;
+            }
+            // `lower_k` is a stale bound, and unlike the other insertion paths this
+            // stream is unbounded, so staleness would be unbounded cost (a stale bound of
+            // 0 with a heavy item enumerates ~a*m*item_weight darts). Recompute every m
+            // darts, in addition to the every-m-improvements refresh below that all
+            // insertion paths share; refreshes read registers only and never touch the
+            // RNG, so they cannot desynchronize the stream across sketches.
+            darts_since_refresh += 1;
+            if darts_since_refresh >= self.params.m {
+                darts_since_refresh = 0;
+                self.refresh_lower_k();
+                if k as f64 <= self.lower_k {
+                    break;
+                }
+            }
+            // Fixed draw order for every dart, used or not.
+            let u: f64 = rng.sample::<f64, _>(StandardUniform);
+            let idx_bits: u64 = rng.sample::<u64, _>(StandardUniform);
+            if u >= keep_fraction {
+                // The dart falls in the part of the item's mass we were asked to leave
+                // out.
+                continue;
+            }
+            // Fixed-point map of idx_bits onto 0..m (bias < m/2^64). Like
+            // `mix_octave_seed`, this map is part of the persisted-sketch format.
+            let i = ((idx_bits as u128 * self.params.m as u128) >> 64) as usize;
+            if k > self.k_vec[i] {
+                self.k_vec[i] = k;
+                self.nbmin += 1;
+                // Unlike the intra-stream refresh above, this one keeps `lower_k` fresh
+                // *across* streams: improvements accumulate as the sketch grows, so this
+                // fires every constant-factor growth in total mass. Without it, streams
+                // shorter than m darts would never refresh and every insertion into a
+                // warm sketch would pay ~m darts against a permanently stale bound.
+                if self.nbmin.is_multiple_of(self.params.m) {
+                    self.refresh_lower_k();
+                }
+            }
+        }
+    }
+
+    fn refresh_lower_k(&mut self) {
+        let flow = self
+            .k_vec
+            .iter()
+            .fold(self.k_vec[0], |min: I, x| if x < &min { *x } else { min })
+            as f64;
+        self.lower_k = flow;
+    }
+
+    /// Add the given value to the sketch using the given weight.
+    ///
+    /// The cardinality estimate that results from weighted insertions is the sum of the weights.
+    ///
+    /// The recommended parameters are tuned for cardinality estimates between 1 and 10^28; weights
+    /// that cause cardinality estimates outside of that range may be expected to be poorly behaved.
+    ///
+    /// When the same item is sketched more than once using different weights, the following
+    /// behaviors apply:
+    ///
+    ///  1. Within one sketch, only the largest weight "counts"; re-inserting with smaller weights
+    ///     is a nop.
+    ///  2. All cardinality estimates and locality sensitivity remains fully correct.
+    ///
+    /// Use of this function cannot be mixed with any of the other sketch methods.
+    pub fn sketch_weighted(&mut self, to_sketch: &T, weight: u64) {
+        if weight == 0 {
+            return;
+        }
+        let hval: u64 = self.b_hasher.hash_one(&to_sketch);
+        // We'd like to use `dart_sketch_weighted`, but need to do some trickery to work around the
+        // odd performance characteristics of that. We do something like this: Imagine we have an
+        // item with weight 21; instead of sketching that item directly, we sketch virtual items
+        // with weights like `(I_1, 1), (I_2, 1), (I_4, 2), (I_8, 4), (I_16, 8), (I_32, 5)`, one
+        // per octave `[2^(j-1), 2^j)` of the interval `[0, 21)`; the `max_weight` of each item is
+        // the width of its octave (so it's trivially fixed per-item), and every item has full
+        // weight except the one on the octave straddling 21, which retains only the part below 21.
+        //
+        // The insertion order is what makes sure the max_weight is never much more than the
+        // cardinality: the largest *full* octave goes first, because it is guaranteed to raise the
+        // sketch's cardinality to at least `weight / 4`, putting every later stream's max_weight
+        // within a constant factor of the cardinality. The straddling octave cannot be trusted
+        // with this job even though it has the largest max_weight: it may retain almost nothing
+        // (consider weight = 2^n + 1), and unretained darts never improve registers, so on a cold
+        // sketch it would run its full `O(max_weight / (weight + cardinality))` cost with nothing
+        // in the denominator.
+        let top = weight.ilog2();
+        self.dart_octave(hval, top, weight);
+        if !weight.is_power_of_two() {
+            // The straddling octave enumerates at twice the rate of the largest full one, so get
+            // it done while whatever mass it does retain can still benefit the remaining streams.
+            self.dart_octave(hval, top + 1, weight);
+        }
+        for j in (0..top).rev() {
+            self.dart_octave(hval, j, weight);
+        }
+    }
+
+    /// Sketches the octave-`j` virtual sub-item of an item with the given hash and total weight.
+    ///
+    /// Octave `j` covers `[2^(j-1), 2^j)` of the mass interval (octave 0 covers `[0, 1)`); the
+    /// sub-item's weight is however much of that interval lies below `weight`.
+    fn dart_octave(&mut self, hval: u64, j: u32, weight: u64) {
+        let lo: u128 = if j == 0 { 0 } else { 1u128 << (j - 1) };
+        let hi: u128 = 1u128 << j;
+        let max_weight = (hi - lo) as f64;
+        let sub_weight = ((weight as u128).min(hi) - lo) as f64;
+        self.dart_sketch_weighted(mix_octave_seed(hval, j), sub_weight, max_weight);
     }
 }
 
@@ -607,6 +797,7 @@ mod tests {
         [
             SetSketcher::sketch_weighted_locality_stable,
             SetSketcher::sketch_weighted_locality_unstable,
+            SetSketcher::sketch_weighted,
         ]
     }
 
@@ -697,6 +888,153 @@ mod tests {
         let expected_matches = a.params.m * 2 / 3;
         assert!(matches > expected_matches - 100);
         assert!(matches < expected_matches + 100);
+    }
+
+    #[test]
+    fn check_dart_locality_and_monotonicity_on_mismatched_weights() {
+        for (wa, wb) in [(100u64, 150u64), (5, 8), (5, 6), (1000, 1500), (7, 970)] {
+            let mut a = usize_sketcher();
+            a.sketch_weighted(&0, wa);
+            let mut b = usize_sketcher();
+            b.sketch_weighted(&0, wb);
+
+            let mut matches = 0usize;
+            for (ra, rb) in a.get_registers().iter().zip(b.get_registers().iter()) {
+                // Exact: the smaller weight's darts are a subset of the larger's.
+                assert!(ra <= rb, "w={wa} vs {wb}: register {ra} > {rb}");
+                if ra == rb {
+                    matches += 1;
+                }
+            }
+            // The match probability is the weighted Jaccard similarity `wa / wb`, plus a
+            // correction for both registers landing in the zero bucket (negligible under
+            // the recommended params, where `Pr[register = 0] = exp(-w / inva)`).
+            let q = wa as f64 / wb as f64;
+            let p = q + (1. - q) * (-(wb as f64) / a.params.inva).exp();
+            let m = a.params.m as f64;
+            let sigma = (m * p * (1. - p)).sqrt();
+            assert!(
+                ((matches as f64) - m * p).abs() < 5. * sigma + 8.,
+                "w={wa} vs {wb}: {matches} matches, expected ~{}",
+                m * p
+            );
+        }
+    }
+
+    #[test]
+    fn check_dart_max_weight_wins_exactly() {
+        let mut b = usize_sketcher();
+        b.sketch_weighted(&7, 5);
+
+        let mut a = usize_sketcher();
+        a.sketch_weighted(&7, 5);
+        a.sketch_weighted(&7, 3);
+        assert_eq!(a.get_registers(), b.get_registers());
+
+        let mut c = usize_sketcher();
+        c.sketch_weighted(&7, 3);
+        c.sketch_weighted(&7, 5);
+        assert_eq!(c.get_registers(), b.get_registers());
+    }
+
+    #[test]
+    fn check_dart_weighted_jaccard_multi_element() {
+        // A: 0..100 at weight 2 (mass 200). B: 50..150 at weight 3 (mass 300).
+        // sum max = 50*2 + 50*3 + 50*3 = 400; per register:
+        //   Pr[S == O] = sum min / sum max     = 100/400
+        //   Pr[S > O]  = sum (wA - wB)+ / max  = 100/400
+        //   Pr[S < O]  =                         200/400
+        let mut a = usize_sketcher();
+        for v in 0..100usize {
+            a.sketch_weighted(&v, 2);
+        }
+        let mut b = usize_sketcher();
+        for v in 50..150usize {
+            b.sketch_weighted(&v, 3);
+        }
+        check_cardinality_is_about(&a, 200);
+        check_cardinality_is_about(&b, 300);
+        check_cardinality_is_about(&a.clone().union(&b), 400);
+
+        let (mut eq, mut gt, mut lt) = (0usize, 0usize, 0usize);
+        for (ra, rb) in a.get_registers().iter().zip(b.get_registers().iter()) {
+            match ra.cmp(rb) {
+                std::cmp::Ordering::Equal => eq += 1,
+                std::cmp::Ordering::Greater => gt += 1,
+                std::cmp::Ordering::Less => lt += 1,
+            }
+        }
+        let m = a.params.m as f64;
+        for (count, p, name) in [(eq, 0.25, "eq"), (gt, 0.25, "gt"), (lt, 0.5, "lt")] {
+            let sigma = (m * p * (1. - p)).sqrt();
+            assert!(
+                ((count as f64) - m * p).abs() < 5. * sigma + 8.,
+                "{name}: {count} vs expected ~{}",
+                m * p
+            );
+        }
+
+        // The O(1) prefix filter reads weight-mass proportions:
+        // p_a / (p_a + p_i) = 0.25 / 0.5 = 0.5, up to 48-register prefix noise. Bounds kept
+        // deliberately loose.
+        let (low, high) = a.approx_proportion_not_included(&b);
+        assert!(low < 0.62, "low bound {low}");
+        assert!(high > 0.38, "high bound {high}");
+    }
+
+    #[test]
+    fn check_dart_heavy_weight_into_partially_filled_sketch() {
+        // Regression canary for `lower_k` staleness: without the per-stream refresh in
+        // `dart_sketch_weighted` this enumerates ~a*m*w (order 1e17) darts and effectively
+        // hangs.
+        let mut a = usize_sketcher();
+        for v in 0..3usize {
+            a.sketch_weighted(&v, 1);
+        }
+        a.sketch_weighted(&1000, 1_000_000_000_000);
+        check_cardinality_is_about(&a, 1_000_000_000_003);
+    }
+
+    #[test]
+    fn check_dart_cut_octave_into_cold_sketch() {
+        // Cost canary for the octave insertion order: the first octave processed must be a
+        // full one. Weight 2^40 + 1 cuts octave 41 down to weight 1; processed against an
+        // empty sketch, that octave would enumerate ~a*m*2^40 darts (years of work), since
+        // its darts are almost never retained and so can never raise `lower_k` themselves.
+        let mut a = usize_sketcher();
+        a.sketch_weighted(&0, (1 << 40) + 1);
+        check_cardinality_is_about(&a, (1 << 40) + 1);
+    }
+
+    #[test]
+    fn check_dart_nesting_law_directly() {
+        // The primitive's contract in isolation: same (seed, max_weight), different
+        // weight. Match probability is 2/8 plus the zero-bucket correction (negligible
+        // under the recommended params).
+        let seed = 0x5EED_u64;
+        let mut full = usize_sketcher();
+        full.dart_sketch_weighted(seed, 8., 8.);
+        let mut thin = usize_sketcher();
+        thin.dart_sketch_weighted(seed, 2., 8.);
+
+        check_cardinality_is_about(&full, 8);
+        check_cardinality_is_about(&thin, 2);
+
+        let mut matches = 0usize;
+        for (rt, rf) in thin.get_registers().iter().zip(full.get_registers().iter()) {
+            assert!(rt <= rf);
+            if rt == rf {
+                matches += 1;
+            }
+        }
+        let p = 0.25 + 0.75 * (-8.0f64 / full.params.inva).exp();
+        let m = full.params.m as f64;
+        let sigma = (m * p * (1. - p)).sqrt();
+        assert!(
+            ((matches as f64) - m * p).abs() < 5. * sigma + 8.,
+            "{matches} matches, expected ~{}",
+            m * p
+        );
     }
 
     #[test]
