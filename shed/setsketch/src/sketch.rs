@@ -39,8 +39,6 @@ use rand_distr::StandardUniform;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 
-use crate::fyshuffle::FyShuffle;
-
 /// Parameter set used by `SetSketcher`
 #[derive(Copy, Clone, Debug)]
 pub struct SetSketchParams {
@@ -356,7 +354,6 @@ pub struct SetSketcher<T, H: Hasher + Default> {
     // minimum of values stored in vec_k
     lower_k: f64,
     nbmin: usize,
-    permut_generator: FyShuffle,
     /// the Hasher to use if data arrive unhashed. Anyway the data type we sketch must satisfy the
     /// trait Hash
     b_hasher: BuildHasherDefault<H>,
@@ -388,7 +385,6 @@ where
             data: SetSketch::new(params),
             lower_k: 0.,
             nbmin: 0,
-            permut_generator: FyShuffle::new(params.m),
             b_hasher,
             t_marker: PhantomData,
         }
@@ -398,8 +394,11 @@ where
         self.data
     }
 
+    /// Add the given value to the sketch.
+    ///
+    /// This is just `sketch_weighted` with weight 1.
     pub fn sketch(&mut self, to_sketch: &T) {
-        self.sketch_weighted_locality_unstable(to_sketch, 1);
+        self.sketch_weighted(to_sketch, 1);
     }
 
     /// Just pulls out the logic that takes a sample from an exponential distribution with parameter
@@ -409,119 +408,6 @@ where
         let z = (1. - lb_s).floor();
         z.clamp(0.0, I::MAX as f64) as I
     }
-
-    /// Add the given value to the sketch using the given weight.
-    ///
-    /// The cardinality estimate that results from weighted insertions is the sum of the weights.
-    ///
-    /// The recommended parameters are tuned for cardinality estimates between 1 and 10^28; weights
-    /// that cause cardinality estimates outside of that range may be expected to be poorly behaved.
-    ///
-    /// When the same item is sketched more than once using different weights, the following
-    /// behaviors apply:
-    ///
-    ///  1. Within one sketch, only the largest weight "counts"; re-inserting with smaller weights
-    ///     is a nop.
-    ///  2. Cardinality estimates based on the sketch remain fully correct. This also applies to any
-    ///     other values derived from cardinality estimates, such as inclusion-exclusion based
-    ///     Jaccard similarity (the absolute_overlap function).
-    ///  3. However, locality sensitivity becomes incorrect; concretely, sketches normally have a
-    ///     coupling property in which two sketches are equal on any given pair of registers with
-    ///     probability exactly their Jaccard similarity. This property is violated when the two
-    ///     sketches sketch the same value with different weights. The only exception to this is
-    ///     when the difference between the weights differs by factor << 1/b (1000 under the
-    ///     recommended parameters)
-    ///
-    /// Use of this function can be mixed with the unweighted `sketch`; `sketch` is just an alias
-    /// for this with weight 1.
-    ///
-    /// For new sketch corpuses, prefer `sketch_weighted`, which is just as fast but keeps
-    /// locality sensitivity.
-    pub fn sketch_weighted_locality_unstable(&mut self, to_sketch: &T, weight: u64) {
-        if weight == 0 {
-            return;
-        }
-        let hval1: u64 = self.b_hasher.hash_one(&to_sketch);
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(hval1);
-        self.permut_generator.reset();
-
-        let mut x_pred: f64 = 0.;
-        // The inverse of the parameter of the exponential distribution we use; the miminum of `N`
-        // samples from an exponential distribution with param `a` is itself exponentially
-        // distributed with param `aN`, so this is the only thing we have to do to account for
-        // weight
-        let inv_exp_param = self.params.inva / (weight as f64);
-        for j in 0..self.params.m {
-            let x_j = x_pred
-                + (inv_exp_param / (self.params.m - j) as f64) * rng.sample::<f64, Exp1>(Exp1); // use Ziggurat
-            x_pred = x_j;
-            let k = Self::exp_sample_into_register_value(x_j, self.params);
-            if k as f64 <= self.lower_k {
-                break;
-            }
-            let i = self.permut_generator.next(&mut rng);
-            if k > self.k_vec[i] {
-                self.k_vec[i] = k;
-                self.nbmin += 1;
-                if self.nbmin.is_multiple_of(self.params.m) {
-                    let flow = self
-                        .k_vec
-                        .iter()
-                        .fold(self.k_vec[0], |min: I, x| if x < &min { *x } else { min })
-                        as f64;
-                    self.lower_k = flow;
-                }
-            }
-        }
-    }
-}
-
-/// Samples `n` times from an exponential distribution with parameter 1 and returns the
-/// minimum of the n samples.
-///
-/// This is optimized to take time logarithmic in n.
-///
-/// Note that unlike other strategies, this has correct marginal behavior. Concretely, when
-/// calling this twice with the same RNG state, but n = 1000 in the one case and n = 1001 in
-/// the other case, the return value will be the same with probability 1000/1001.
-fn sample_min_exp_stable(rng: &mut Xoshiro256PlusPlus, n: u64) -> f64 {
-    let mut current_index = 0;
-    let mut min = 1.0f64;
-    loop {
-        // We implement the index jumping algorithm. Say that the last index we considered
-        // is i. Instead of now going and sampling once for i+1, i+2, etc. we directly
-        // compute and sample from the distribution of "how many more samples will I need
-        // until I see a new minimum value."
-        //
-        // It's better in every way if we begin by ignoring the exponential distribution and
-        // just do this in uniform space
-        let delta = if min == 1. {
-            1
-        } else {
-            // Each successive value is less than the current minimum with probability `min` (again,
-            // since we're in uniform space). So the number of samples until we see a new minimum is
-            // geometrically distributed with parameter `min`. This samples from such a
-            // distribution. We avoid using `rand_distr`'s `Geometric` because it's 1) optimized for
-            // repeated sampling instead of a single sample and 2) numerically unstable for very
-            // small `min`
-            let u: f64 = rng.sample::<f64, _>(StandardUniform);
-            // Note: Very important for numerical stability here and below to use `ln_1p`, not
-            // `(1-min).ln()`; `1-min` loses all the float precision
-            (u.ln() / (-min).ln_1p()).floor() as u64 + 1
-        };
-        let next_min_index = current_index + delta;
-        if next_min_index > n {
-            // The next minimum would come after the number of samples we have, so we're done
-            break;
-        }
-        current_index = next_min_index;
-        // The new min value is uniformly distributed conditional on it indeed being a min
-        // value
-        min *= rng.sample::<f64, _>(StandardUniform);
-    }
-
-    // Transfer into exponential space
-    -(-min).ln_1p()
 }
 
 /// Derives the seed of the dart stream for a given (element hash, octave) pair.
@@ -534,48 +420,6 @@ fn mix_octave_seed(hval: u64, octave: u32) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
-}
-
-impl<T, H> SetSketcher<T, H>
-where
-    T: Hash,
-    H: Hasher + Default,
-{
-    /// Add the given value to the sketch using the given weight.
-    ///
-    /// See first the documentation for `sketch_weighted_locality_unstable`.
-    ///
-    /// This function has generally similar semantics to that one but differs in two ways:
-    ///
-    ///  1. It recovers the locality sensitivity property that is documented to be lost there.
-    ///  2. However, it's quite a bit slower. Unweighted sketching and locality unstable weighted
-    ///     sketching are amortized `O(1)`. This is `O(m log W)` for `W` the weight and `m` the
-    ///     number of registers.
-    ///
-    /// This function also must not be mixed with unweighted sketches (for a given item anyway).
-    ///
-    /// For new sketch corpuses, prefer `sketch_weighted`, which offers the same guarantees in
-    /// amortized O(1).
-    pub fn sketch_weighted_locality_stable(&mut self, to_sketch: &T, weight: u64) {
-        if weight == 0 {
-            return;
-        }
-        let hval: u64 = self.b_hasher.hash_one(&to_sketch);
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(hval);
-        for r in self.data.k_vec.iter_mut() {
-            // `sample_min_exp_stable` uses an amount of randomness that depends on the value of
-            // `n`, so we need to do this to make sure that the rng state at the beginning of
-            // subsequent loop iterations doesn't depend on n
-            let mut iter_rng = rng.clone();
-            rng.jump();
-
-            let s = sample_min_exp_stable(&mut iter_rng, weight) * self.data.params.inva;
-            let k = Self::exp_sample_into_register_value(s, self.data.params);
-            if k > *r {
-                *r = k;
-            }
-        }
-    }
 }
 
 impl<T, H> SetSketcher<T, H>
@@ -700,7 +544,8 @@ where
     ///     is a nop.
     ///  2. All cardinality estimates and locality sensitivity remains fully correct.
     ///
-    /// Use of this function cannot be mixed with any of the other sketch methods.
+    /// Use of this function can be mixed with the unweighted `sketch`; `sketch` is just an alias
+    /// for this with weight 1.
     pub fn sketch_weighted(&mut self, to_sketch: &T, weight: u64) {
         if weight == 0 {
             return;
@@ -792,102 +637,43 @@ mod tests {
         check_cardinality_is_about(&sethasher_a, union);
     }
 
-    fn weighted_styles()
-    -> impl IntoIterator<Item = fn(&mut SetSketcher<usize, FnvHasher>, &usize, u64)> {
-        [
-            SetSketcher::sketch_weighted_locality_stable,
-            SetSketcher::sketch_weighted_locality_unstable,
-            SetSketcher::sketch_weighted,
-        ]
-    }
-
     #[test]
     fn check_weighted_single() {
-        for sketch in weighted_styles() {
-            for v in [1, 10, 10000] {
-                let mut s = usize_sketcher();
-                sketch(&mut s, &0, v);
-                check_cardinality_is_about(&s, v);
-            }
+        for v in [1, 10, 10000] {
+            let mut s = usize_sketcher();
+            s.sketch_weighted(&0, v);
+            check_cardinality_is_about(&s, v);
         }
     }
 
     #[test]
     fn check_weighted_sums_reasonably() {
-        for sketch in weighted_styles() {
-            let mut a = usize_sketcher();
-            for i in 1..=100 {
-                sketch(&mut a, &i, i as u64);
-            }
-            check_cardinality_is_about(&a, 5050);
+        let mut a = usize_sketcher();
+        for i in 1..=100 {
+            a.sketch_weighted(&i, i as u64);
         }
+        check_cardinality_is_about(&a, 5050);
     }
 
     #[test]
     fn check_well_behaved_under_different_weights() {
-        for sketch in weighted_styles() {
-            let mut a = usize_sketcher();
-            sketch(&mut a, &0, 100);
-            for i in 1..=10 {
-                sketch(&mut a, &i, 10);
-            }
-            sketch(&mut a, &0, 105);
-            check_cardinality_is_about(&a, 205);
+        let mut a = usize_sketcher();
+        a.sketch_weighted(&0, 100);
+        for i in 1..=10 {
+            a.sketch_weighted(&i, 10);
         }
+        a.sketch_weighted(&0, 105);
+        check_cardinality_is_about(&a, 205);
     }
 
     #[test]
     fn check_large_weights() {
-        for sketch in weighted_styles() {
-            let mut a = usize_sketcher();
-            const MULT: u64 = 1_000_000_000_000;
-            for i in 1..=100 {
-                sketch(&mut a, &i, i as u64 * MULT);
-            }
-            check_cardinality_is_about(&a, 5050 * MULT);
-        }
-    }
-
-    #[test]
-    fn check_non_locality_sensitivity_on_mismatched_weights() {
-        for weight in [1000, 20000] {
-            let mut a = usize_sketcher();
-            a.sketch_weighted_locality_unstable(&0, weight);
-            let mut b = usize_sketcher();
-            b.sketch_weighted_locality_unstable(&0, weight + 1);
-
-            let matches = a
-                .get_registers()
-                .iter()
-                .zip(b.get_registers().iter())
-                .filter(|(a, b)| a == b)
-                .count();
-            // See the note about locality sensitivity on the function above
-            if weight == 1000 {
-                assert!(matches < a.params.m / 10);
-            } else {
-                assert!(matches > a.params.m * 9 / 10);
-            }
-        }
-    }
-
-    #[test]
-    fn check_locality_sensitivity_on_mismatched_weights() {
         let mut a = usize_sketcher();
-        a.sketch_weighted_locality_stable(&0, 100);
-        let mut b = usize_sketcher();
-        b.sketch_weighted_locality_stable(&0, 150);
-
-        let matches = a
-            .get_registers()
-            .iter()
-            .zip(b.get_registers().iter())
-            .filter(|(a, b)| a == b)
-            .count();
-        // See the note about locality sensitivity on the function above
-        let expected_matches = a.params.m * 2 / 3;
-        assert!(matches > expected_matches - 100);
-        assert!(matches < expected_matches + 100);
+        const MULT: u64 = 1_000_000_000_000;
+        for i in 1..=100 {
+            a.sketch_weighted(&i, i as u64 * MULT);
+        }
+        check_cardinality_is_about(&a, 5050 * MULT);
     }
 
     #[test]

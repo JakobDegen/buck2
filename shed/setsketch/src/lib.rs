@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-mod fyshuffle;
 mod sketch;
 
 pub use sketch::SetSketch;
